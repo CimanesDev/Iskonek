@@ -17,6 +17,8 @@ import {
   Filter
 } from "lucide-react";
 import { toast } from "sonner";
+import { supabase } from "@/integrations/supabase/client";
+import { v4 as uuidv4 } from 'uuid';
 
 const VideoChat = () => {
   const [isVideoOn, setIsVideoOn] = useState(true);
@@ -32,8 +34,10 @@ const VideoChat = () => {
     connectionType: "any"
   });
 
-  const localVideoRef = useRef<HTMLVideoElement>(null);
+  const localVideoMainRef = useRef<HTMLVideoElement>(null);
+  const localVideoPreviewRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
 
   const mockPeerProfile = {
     name: "Maria Santos",
@@ -47,36 +51,190 @@ const VideoChat = () => {
     }
   };
 
+  const [roomId, setRoomId] = useState<string | null>(null);
+  const [queueId, setQueueId] = useState<string | null>(null);
+  const [userId, setUserId] = useState<string | null>(null);
+
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const [peerStream, setPeerStream] = useState<MediaStream | null>(null);
+
+  const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+  const supabaseRealtimeRef = useRef<any>(null);
+
   useEffect(() => {
-    if (localVideoRef.current) {
-      navigator.mediaDevices.getUserMedia({ video: true, audio: true })
-        .then(stream => {
-          if (localVideoRef.current) {
-            localVideoRef.current.srcObject = stream;
-          }
-        })
-        .catch(err => {
-          console.error("Error accessing media devices:", err);
-          toast.error("Unable to access camera/microphone");
-        });
-    }
+    navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+      .then(stream => {
+        localStreamRef.current = stream;
+        if (localVideoMainRef.current && !isConnected) {
+          localVideoMainRef.current.srcObject = stream;
+        }
+        if (localVideoPreviewRef.current && isConnected) {
+          localVideoPreviewRef.current.srcObject = stream;
+        }
+      })
+      .catch(err => {
+        console.error("Error accessing media devices:", err);
+        toast.error("Unable to access camera/microphone");
+      });
+    // Clean up
+    return () => {
+      localStreamRef.current?.getTracks().forEach(track => track.stop());
+    };
   }, []);
 
-  const startSearch = () => {
-    setIsSearching(true);
-    toast.info("Searching for a fellow Isko/Iska...");
-    
-    setTimeout(() => {
-      setIsSearching(false);
-      setIsConnected(true);
-      toast.success("Connected to a fellow UP student!");
-    }, 3000);
+  useEffect(() => {
+    // Attach/detach stream to correct video element on connection change
+    if (localStreamRef.current) {
+      if (isConnected) {
+        if (localVideoPreviewRef.current) {
+          localVideoPreviewRef.current.srcObject = localStreamRef.current;
+        }
+        if (localVideoMainRef.current) {
+          localVideoMainRef.current.srcObject = null;
+        }
+      } else {
+        if (localVideoMainRef.current) {
+          localVideoMainRef.current.srcObject = localStreamRef.current;
+        }
+        if (localVideoPreviewRef.current) {
+          localVideoPreviewRef.current.srcObject = null;
+        }
+      }
+    }
+  }, [isConnected]);
+
+  useEffect(() => {
+    // Actually enable/disable video tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getVideoTracks().forEach(track => {
+        track.enabled = isVideoOn;
+      });
+    }
+  }, [isVideoOn]);
+
+  useEffect(() => {
+    // Actually enable/disable audio tracks
+    if (localStreamRef.current) {
+      localStreamRef.current.getAudioTracks().forEach(track => {
+        track.enabled = isAudioOn;
+      });
+    }
+  }, [isAudioOn]);
+
+  useEffect(() => {
+    // Get current user id
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      setUserId(user?.id ?? null);
+    });
+  }, []);
+
+  const cleanupQueue = async () => {
+    if (queueId) {
+      await supabase.from('videochat_queue').delete().eq('id', queueId);
+      setQueueId(null);
+    }
   };
 
-  const endCall = () => {
+  useEffect(() => {
+    // Cleanup queue on unmount
+    return () => { cleanupQueue(); };
+  }, []);
+
+  useEffect(() => {
+    if (!roomId) return;
+    // Create a new channel for this room
+    const channel = supabase.channel(roomId);
+    supabaseRealtimeRef.current = channel;
+    channel.on('broadcast', { event: 'signal' }, async (payload) => {
+      const { type, data } = payload.payload;
+      if (!peerConnectionRef.current) return;
+      if (type === 'offer') {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await peerConnectionRef.current.createAnswer();
+        await peerConnectionRef.current.setLocalDescription(answer);
+        channel.send({ type: 'broadcast', event: 'signal', payload: { type: 'answer', data: answer } });
+      } else if (type === 'answer') {
+        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+      } else if (type === 'ice') {
+        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data));
+      }
+    });
+    channel.subscribe();
+    return () => { channel.unsubscribe(); };
+  }, [roomId]);
+
+  const startPeerConnection = async (roomOverride?: string) => {
+    const pc = new RTCPeerConnection(rtcConfig);
+    peerConnectionRef.current = pc;
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
+    }
+    pc.ontrack = (event) => {
+      setPeerStream(event.streams[0]);
+      if (remoteVideoRef.current) {
+        remoteVideoRef.current.srcObject = event.streams[0];
+      }
+    };
+    pc.onicecandidate = (event) => {
+      if (event.candidate && supabaseRealtimeRef.current) {
+        supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'ice', data: event.candidate } });
+      }
+    };
+    if (!roomOverride || !supabaseRealtimeRef.current) return;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'offer', data: offer } });
+  };
+
+  const startSearch = async () => {
+    setIsSearching(true);
+    toast.info("Searching for a fellow Isko/Iska...");
+    // Try to find another user in the queue
+    const { data: waiting } = await supabase
+      .from('videochat_queue')
+      .select('*')
+      .neq('user_id', userId)
+      .is('room_id', null)
+      .order('created_at', { ascending: true })
+      .limit(1);
+    if (waiting && waiting.length > 0) {
+      // Pair with this user
+      const match = waiting[0];
+      const newRoomId = `videochat-room-${uuidv4()}`;
+      // Update both queue entries with the room_id
+      await supabase.from('videochat_queue').update({ room_id: newRoomId }).eq('id', match.id);
+      const { data: myEntry, error } = await supabase.from('videochat_queue').insert({ user_id: userId, room_id: newRoomId }).select().single();
+      setQueueId(myEntry.id);
+      setRoomId(newRoomId);
+      setIsSearching(false);
+      setIsConnected(true);
+      await startPeerConnection(newRoomId);
+      toast.success("Connected to a fellow UP student!");
+    } else {
+      // No one waiting, add self to queue
+      const { data: myEntry, error } = await supabase.from('videochat_queue').insert({ user_id: userId }).select().single();
+      setQueueId(myEntry.id);
+      // Poll for a match
+      const poll = setInterval(async () => {
+        const { data: updated } = await supabase.from('videochat_queue').select('*').eq('id', myEntry.id).single();
+        if (updated && updated.room_id) {
+          clearInterval(poll);
+          setRoomId(updated.room_id);
+          setIsSearching(false);
+          setIsConnected(true);
+          await startPeerConnection(updated.room_id);
+          toast.success("Connected to a fellow UP student!");
+        }
+      }, 1500);
+    }
+  };
+
+  const endCall = async () => {
     setIsConnected(false);
     setShowProfile(false);
     setChatMessages([]);
+    await cleanupQueue();
     toast.info("Call ended");
   };
 
@@ -142,21 +300,26 @@ const VideoChat = () => {
                 <div className="relative bg-black flex-1">
                   {/* Remote Video */}
                   <div className="relative h-full">
-                    {isConnected ? (
+                    {isConnected && peerStream ? (
                       <video
                         ref={remoteVideoRef}
                         className="w-full h-full object-cover"
                         autoPlay
                         playsInline
+                        style={{ background: '#222' }}
                       />
-                    ) : (
+                    ) : !isConnected ? (
                       <video
-                        ref={localVideoRef}
+                        ref={localVideoMainRef}
                         className="w-full h-full object-cover"
                         autoPlay
                         playsInline
                         muted
                       />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center bg-gray-900">
+                        <span className="text-white text-2xl">Waiting for peer video...</span>
+                      </div>
                     )}
                     {isConnected && (
                       <div className="absolute top-4 left-4">
@@ -172,9 +335,9 @@ const VideoChat = () => {
                   
                   {/* Local Video Preview (only show when connected) */}
                   {isConnected && (
-                    <div className="absolute bottom-20 right-4 w-48 h-36 rounded-lg overflow-hidden border-2 border-white shadow-lg">
+                    <div className="absolute bottom-20 right-4 w-48 h-36 rounded-lg overflow-hidden border-2 border-white shadow-lg bg-black">
                       <video
-                        ref={localVideoRef}
+                        ref={localVideoPreviewRef}
                         className="w-full h-full object-cover"
                         autoPlay
                         playsInline
