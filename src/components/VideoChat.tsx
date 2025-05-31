@@ -62,6 +62,8 @@ const VideoChat = () => {
 
   const supabaseRealtimeRef = useRef<any>(null);
 
+  const [searchingCount, setSearchingCount] = useState(0);
+
   useEffect(() => {
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then(stream => {
@@ -279,6 +281,22 @@ const VideoChat = () => {
     toast.info(isAudioOn ? "Microphone muted" : "Microphone unmuted");
   };
 
+  useEffect(() => {
+    let interval: any;
+    if (isSearching) {
+      interval = setInterval(async () => {
+        const { count } = await supabase
+          .from('videochat_queue')
+          .select('*', { count: 'exact', head: true })
+          .is('room_id', null);
+        setSearchingCount(count || 0);
+      }, 2000);
+    } else {
+      setSearchingCount(0);
+    }
+    return () => clearInterval(interval);
+  }, [isSearching]);
+
   return (
     <div className="min-h-screen bg-white">
       <div className="max-w-7xl mx-auto p-4">
@@ -288,6 +306,11 @@ const VideoChat = () => {
           <h1 className="text-3xl font-bold text-[#7b1113] mb-2">Video Chat</h1>
           <p className="text-gray-600">Connect with fellow UP students through video chat</p>
         </div>
+        {isSearching && (
+          <div className="text-center text-gray-500 mb-4">
+            {searchingCount} {searchingCount === 1 ? 'person' : 'people'} searching...
+          </div>
+        )}
 
         <div className="grid grid-cols-1 xl:grid-cols-4 gap-6 h-[calc(100vh-180px)]">
           
