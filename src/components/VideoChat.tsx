@@ -238,15 +238,32 @@ const VideoChat = () => {
           setPeerName(peerProfile?.name || null);
           await startPeerConnection(updated.room_id);
           toast.success("Connected to a fellow UP student!");
+        } else {
+          // If room_id is set but no peer found, still update UI and wait for peer
+          clearInterval(pollRef.current);
+          pollRef.current = null;
+          setRoomId(updated.room_id);
+          setIsSearching(false);
+          setIsConnected(true);
+          setPeerName(null);
+          await startPeerConnection(updated.room_id);
+          toast.success("Waiting for peer to connect...");
         }
       } else {
         // Try to pair with another searching user
-        const { data: others } = await supabase.from('videochat_queue').select('*').is('room_id', null).neq('user_id', userId);
-        if (others && others.length > 0) {
-          const peer = others[0];
+        const { data: others } = await supabase.from('videochat_queue').select('*').neq('user_id', userId);
+        // 1. If another user has a non-null room_id, join their room
+        const peerWithRoom = others && others.find((u: any) => u.room_id);
+        if (peerWithRoom && !updated.room_id) {
+          await supabase.from('videochat_queue').update({ room_id: peerWithRoom.room_id }).eq('id', myEntry.id);
+          // Next poll will pick up the room_id and connect
+          return;
+        }
+        // 2. Otherwise, if another user is searching, pair as before
+        const peerSearching = others && others.find((u: any) => !u.room_id);
+        if (peerSearching) {
           const newRoomId = `videochat-room-${uuidv4()}`;
-          // Update both queue entries with the new room_id
-          await supabase.from('videochat_queue').update({ room_id: newRoomId }).in('id', [myEntry.id, peer.id]);
+          await supabase.from('videochat_queue').update({ room_id: newRoomId }).in('id', [myEntry.id, peerSearching.id]);
           // Next poll will pick up the room_id and connect
         }
       }
