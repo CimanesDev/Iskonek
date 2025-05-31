@@ -64,6 +64,11 @@ const VideoChat = () => {
 
   const [searchingCount, setSearchingCount] = useState(0);
 
+  const [peerName, setPeerName] = useState<string | null>(null);
+  const iceCandidateBuffer = useRef<any[]>([]);
+
+  const pollRef = useRef<any>(null);
+
   useEffect(() => {
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then(stream => {
@@ -144,7 +149,6 @@ const VideoChat = () => {
 
   useEffect(() => {
     if (!roomId) return;
-    // Create a new channel for this room
     const channel = supabase.channel(roomId);
     supabaseRealtimeRef.current = channel;
     channel.on('broadcast', { event: 'signal' }, async (payload) => {
@@ -152,13 +156,23 @@ const VideoChat = () => {
       if (!peerConnectionRef.current) return;
       if (type === 'offer') {
         await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+        // Add any buffered ICE candidates
+        iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
+        iceCandidateBuffer.current = [];
         const answer = await peerConnectionRef.current.createAnswer();
         await peerConnectionRef.current.setLocalDescription(answer);
         channel.send({ type: 'broadcast', event: 'signal', payload: { type: 'answer', data: answer } });
       } else if (type === 'answer') {
         await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+        // Add any buffered ICE candidates
+        iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
+        iceCandidateBuffer.current = [];
       } else if (type === 'ice') {
-        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data));
+        if (!peerConnectionRef.current.remoteDescription) {
+          iceCandidateBuffer.current.push(data);
+        } else {
+          await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data));
+        }
       }
     });
     channel.subscribe();
@@ -188,49 +202,45 @@ const VideoChat = () => {
     supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'offer', data: offer } });
   };
 
+  const cancelSearch = async () => {
+    setIsSearching(false);
+    await cleanupQueue(userId);
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
   const startSearch = async () => {
     setIsSearching(true);
     toast.info("Searching for a fellow Isko/Iska...");
-    // Always remove any previous queue entry for this user
     await cleanupQueue(userId);
-    // Try to find another user in the queue
-    const { data: waiting } = await supabase
-      .from('videochat_queue')
-      .select('*')
-      .neq('user_id', userId)
-      .is('room_id', null)
-      .order('created_at', { ascending: true })
-      .limit(1);
-    if (waiting && waiting.length > 0) {
-      // Pair with this user
-      const match = waiting[0];
-      const newRoomId = `videochat-room-${uuidv4()}`;
-      // Update both queue entries with the room_id
-      await supabase.from('videochat_queue').update({ room_id: newRoomId }).eq('id', match.id);
-      const { data: myEntry, error } = await supabase.from('videochat_queue').insert({ user_id: userId, room_id: newRoomId }).select().single();
-      setQueueId(myEntry.id);
-      setRoomId(newRoomId);
-      setIsSearching(false);
-      setIsConnected(true);
-      await startPeerConnection(newRoomId);
-      toast.success("Connected to a fellow UP student!");
-    } else {
-      // No one waiting, add self to queue
-      const { data: myEntry, error } = await supabase.from('videochat_queue').insert({ user_id: userId }).select().single();
-      setQueueId(myEntry.id);
-      // Poll for a match
-      const poll = setInterval(async () => {
-        const { data: updated } = await supabase.from('videochat_queue').select('*').eq('id', myEntry.id).single();
-        if (updated && updated.room_id) {
-          clearInterval(poll);
+    // Add self to queue
+    const { data: myEntry, error } = await supabase.from('videochat_queue').insert({ user_id: userId }).select().single();
+    setQueueId(myEntry.id);
+    // Poll for a match (wait for another user to join and get same room_id)
+    pollRef.current = setInterval(async () => {
+      // Log all searching users for debugging
+      const { data: allSearching } = await supabase.from('videochat_queue').select('*').is('room_id', null);
+      console.log('Currently searching:', allSearching);
+      const { data: updated } = await supabase.from('videochat_queue').select('*').eq('id', myEntry.id).single();
+      if (updated && updated.room_id) {
+        // Find peer in the same room
+        const { data: peers } = await supabase.from('videochat_queue').select('*').eq('room_id', updated.room_id).neq('user_id', userId);
+        if (peers && peers.length > 0) {
+          clearInterval(pollRef.current);
+          pollRef.current = null;
           setRoomId(updated.room_id);
           setIsSearching(false);
           setIsConnected(true);
+          // Fetch peer's name
+          const { data: peerProfile } = await supabase.from('profiles').select('name').eq('id', peers[0].user_id).single();
+          setPeerName(peerProfile?.name || null);
           await startPeerConnection(updated.room_id);
           toast.success("Connected to a fellow UP student!");
         }
-      }, 1500);
-    }
+      }
+    }, 1500);
   };
 
   const endCall = async () => {
@@ -297,6 +307,16 @@ const VideoChat = () => {
     }
     return () => clearInterval(interval);
   }, [isSearching]);
+
+  useEffect(() => {
+    // Cleanup polling on unmount
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-white">
@@ -543,6 +563,25 @@ const VideoChat = () => {
             </Card>
           </div>
         </div>
+
+        {/* Show peer name when connected */}
+        {isConnected && peerName && (
+          <div className="text-center text-lg text-[#7b1113] font-semibold mb-2">
+            Connected to {peerName}
+          </div>
+        )}
+
+        {/* Cancel Search button */}
+        {isSearching && (
+          <div className="text-center mb-4">
+            <button
+              className="bg-gray-200 text-gray-700 px-4 py-2 rounded hover:bg-gray-300 transition"
+              onClick={cancelSearch}
+            >
+              Cancel Search
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
