@@ -131,17 +131,16 @@ const VideoChat = () => {
     });
   }, []);
 
-  const cleanupQueue = async () => {
-    if (queueId) {
-      await supabase.from('videochat_queue').delete().eq('id', queueId);
-      setQueueId(null);
-    }
+  const cleanupQueue = async (uid = userId) => {
+    if (!uid) return;
+    await supabase.from('videochat_queue').delete().eq('user_id', uid);
+    setQueueId(null);
   };
 
   useEffect(() => {
-    // Cleanup queue on unmount
+    // Cleanup queue on unmount or when not searching
     return () => { cleanupQueue(); };
-  }, []);
+  }, [userId]);
 
   useEffect(() => {
     if (!roomId) return;
@@ -192,6 +191,8 @@ const VideoChat = () => {
   const startSearch = async () => {
     setIsSearching(true);
     toast.info("Searching for a fellow Isko/Iska...");
+    // Always remove any previous queue entry for this user
+    await cleanupQueue(userId);
     // Try to find another user in the queue
     const { data: waiting } = await supabase
       .from('videochat_queue')
@@ -236,7 +237,7 @@ const VideoChat = () => {
     setIsConnected(false);
     setShowProfile(false);
     setChatMessages([]);
-    await cleanupQueue();
+    await cleanupQueue(userId);
     toast.info("Call ended");
   };
 
