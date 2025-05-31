@@ -151,7 +151,7 @@ const VideoChat = () => {
     if (!roomId || !userId) return;
     let isCaller = false;
     let peerId: string | null = null;
-    let connectionStarted = false;
+    let offerCreated = false;
 
     const setupConnection = async () => {
       // Find peer in the same room
@@ -169,9 +169,12 @@ const VideoChat = () => {
           localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
         }
         pc.ontrack = (event) => {
-          setPeerStream(event.streams[0]);
-          if (remoteVideoRef.current) {
-            remoteVideoRef.current.srcObject = event.streams[0];
+          // Only set remote video if the stream is not your own
+          if (event.streams[0] !== localStreamRef.current) {
+            setPeerStream(event.streams[0]);
+            if (remoteVideoRef.current) {
+              remoteVideoRef.current.srcObject = event.streams[0];
+            }
           }
         };
         pc.onicecandidate = (event) => {
@@ -180,9 +183,9 @@ const VideoChat = () => {
           }
         };
       }
-      // Only the caller creates the offer
-      if (isCaller && !connectionStarted) {
-        connectionStarted = true;
+      // Only the caller creates the offer, and only once
+      if (isCaller && !offerCreated && peerConnectionRef.current.signalingState === 'stable') {
+        offerCreated = true;
         const offer = await peerConnectionRef.current.createOffer();
         await peerConnectionRef.current.setLocalDescription(offer);
         supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'offer', data: offer } });
@@ -196,18 +199,23 @@ const VideoChat = () => {
       const { type, data } = payload.payload;
       if (!peerConnectionRef.current) return;
       if (type === 'offer') {
-        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
-        // Add any buffered ICE candidates
-        iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
-        iceCandidateBuffer.current = [];
-        const answer = await peerConnectionRef.current.createAnswer();
-        await peerConnectionRef.current.setLocalDescription(answer);
-        channel.send({ type: 'broadcast', event: 'signal', payload: { type: 'answer', data: answer } });
+        // Only set remote description if not already set
+        if (!peerConnectionRef.current.remoteDescription) {
+          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+          // Add any buffered ICE candidates
+          iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
+          iceCandidateBuffer.current = [];
+          const answer = await peerConnectionRef.current.createAnswer();
+          await peerConnectionRef.current.setLocalDescription(answer);
+          channel.send({ type: 'broadcast', event: 'signal', payload: { type: 'answer', data: answer } });
+        }
       } else if (type === 'answer') {
-        await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
-        // Add any buffered ICE candidates
-        iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
-        iceCandidateBuffer.current = [];
+        if (!peerConnectionRef.current.remoteDescription) {
+          await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data));
+          // Add any buffered ICE candidates
+          iceCandidateBuffer.current.forEach(candidate => peerConnectionRef.current!.addIceCandidate(candidate));
+          iceCandidateBuffer.current = [];
+        }
       } else if (type === 'ice') {
         if (!peerConnectionRef.current.remoteDescription) {
           iceCandidateBuffer.current.push(data);
