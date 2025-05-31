@@ -148,7 +148,48 @@ const VideoChat = () => {
   }, [userId]);
 
   useEffect(() => {
-    if (!roomId) return;
+    if (!roomId || !userId) return;
+    let isCaller = false;
+    let peerId: string | null = null;
+    let connectionStarted = false;
+
+    const setupConnection = async () => {
+      // Find peer in the same room
+      const { data: peers } = await supabase.from('videochat_queue').select('*').eq('room_id', roomId).neq('user_id', userId);
+      if (peers && peers.length > 0) {
+        peerId = peers[0].user_id;
+        // Decide who is the caller (lower user_id)
+        isCaller = userId < peerId;
+      }
+      // Always set up RTCPeerConnection and add local stream
+      if (!peerConnectionRef.current) {
+        const pc = new RTCPeerConnection(rtcConfig);
+        peerConnectionRef.current = pc;
+        if (localStreamRef.current) {
+          localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
+        }
+        pc.ontrack = (event) => {
+          setPeerStream(event.streams[0]);
+          if (remoteVideoRef.current) {
+            remoteVideoRef.current.srcObject = event.streams[0];
+          }
+        };
+        pc.onicecandidate = (event) => {
+          if (event.candidate && supabaseRealtimeRef.current) {
+            supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'ice', data: event.candidate } });
+          }
+        };
+      }
+      // Only the caller creates the offer
+      if (isCaller && !connectionStarted) {
+        connectionStarted = true;
+        const offer = await peerConnectionRef.current.createOffer();
+        await peerConnectionRef.current.setLocalDescription(offer);
+        supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'offer', data: offer } });
+      }
+    };
+
+    // Set up signaling channel
     const channel = supabase.channel(roomId);
     supabaseRealtimeRef.current = channel;
     channel.on('broadcast', { event: 'signal' }, async (payload) => {
@@ -176,31 +217,13 @@ const VideoChat = () => {
       }
     });
     channel.subscribe();
-    return () => { channel.unsubscribe(); };
-  }, [roomId]);
-
-  const startPeerConnection = async (roomOverride?: string) => {
-    const pc = new RTCPeerConnection(rtcConfig);
-    peerConnectionRef.current = pc;
-    if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track => pc.addTrack(track, localStreamRef.current!));
-    }
-    pc.ontrack = (event) => {
-      setPeerStream(event.streams[0]);
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0];
-      }
+    // Set up connection as soon as both users are in the room
+    const pollForPeer = setInterval(setupConnection, 1000);
+    return () => {
+      channel.unsubscribe();
+      clearInterval(pollForPeer);
     };
-    pc.onicecandidate = (event) => {
-      if (event.candidate && supabaseRealtimeRef.current) {
-        supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'ice', data: event.candidate } });
-      }
-    };
-    if (!roomOverride || !supabaseRealtimeRef.current) return;
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    supabaseRealtimeRef.current.send({ type: 'broadcast', event: 'signal', payload: { type: 'offer', data: offer } });
-  };
+  }, [roomId, userId]);
 
   const cancelSearch = async () => {
     setIsSearching(false);
@@ -236,7 +259,6 @@ const VideoChat = () => {
           // Fetch peer's name
           const { data: peerProfile } = await supabase.from('profiles').select('name').eq('id', peers[0].user_id).single();
           setPeerName(peerProfile?.name || null);
-          await startPeerConnection(updated.room_id);
           toast.success("Connected to a fellow UP student!");
         } else {
           // If room_id is set but no peer found, still update UI and wait for peer
@@ -246,7 +268,6 @@ const VideoChat = () => {
           setIsSearching(false);
           setIsConnected(true);
           setPeerName(null);
-          await startPeerConnection(updated.room_id);
           toast.success("Waiting for peer to connect...");
         }
       } else {
