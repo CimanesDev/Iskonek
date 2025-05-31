@@ -239,6 +239,16 @@ const VideoChat = () => {
           await startPeerConnection(updated.room_id);
           toast.success("Connected to a fellow UP student!");
         }
+      } else {
+        // Try to pair with another searching user
+        const { data: others } = await supabase.from('videochat_queue').select('*').is('room_id', null).neq('user_id', userId);
+        if (others && others.length > 0) {
+          const peer = others[0];
+          const newRoomId = `videochat-room-${uuidv4()}`;
+          // Update both queue entries with the new room_id
+          await supabase.from('videochat_queue').update({ room_id: newRoomId }).in('id', [myEntry.id, peer.id]);
+          // Next poll will pick up the room_id and connect
+        }
       }
     }, 1500);
   };
